@@ -163,3 +163,35 @@ python window_ops.py close --pattern 记事本
 6. 启动“字符映射表”，枚举子控件，用 `WM_SETTEXT` 写入、`WM_GETTEXT` 读回；
 7. 鼠标点击文本框 → `Ctrl+End` → 真实键盘追加文本；
 8. 关闭所有演示窗口（加 `-KeepOpen` / `--keep-open` 可保留窗口观察）。
+
+---
+
+## RDP / 堡垒机场景
+
+| 文件 | 说明 |
+| --- | --- |
+| `rdp_ops.py` | RDP 位图自动化 + 本地隧道感知（Python，纯标准库） |
+| `RdpOps.ps1` | 同上的 PowerShell 版（mstsc + Win32 + WinRT OCR） |
+| `AccessClient_RDP_Tunnel.md` | AccessClient / mstsc 双端口隧道原理与排障手册 |
+
+### 隧道感知（AccessClient 场景）
+
+堡垒机客户端常在本机 `127.0.0.1` 起代理端口，再以
+`mstsc /v:127.0.0.1:<port>` 拉起远程桌面。两套脚本都内置了三个子命令：
+
+```bash
+python rdp_ops.py tunnel --app AccessClient        # 发现端口/属主/父进程
+python rdp_ops.py wait-port --port 52341 --timeout 20
+python rdp_ops.py health --any --process mstsc --screen
+```
+
+```powershell
+.\RdpOps.ps1 tunnel -App "AccessClient*" -Watch
+.\RdpOps.ps1 wait-port -Port 52341 -TimeoutSec 20
+.\RdpOps.ps1 health -Any -ProcessName mstsc -Screen -Json
+```
+
+- `tunnel` 同时解析 mstsc 命令行 `/v:` 与该进程到回环地址的 `ESTABLISHED` 连接，
+  所以用 `.rdp` 文件启动也能识别端口；
+- `wait-port` 默认只检查 `LISTEN`，不会主动连 RDP 端口（`--connect` / `-Connect` 才会探测）；
+- `health` 返回非零退出码，可直接用于流水线；`--screen` 用连续截图哈希判断画面是否卡死。

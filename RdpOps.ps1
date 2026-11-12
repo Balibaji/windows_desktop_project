@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     RDP / 位图窗口自动化工具（PowerShell 版，纯 Win32 + .NET + WinRT OCR，无第三方依赖）
@@ -22,13 +22,17 @@
       click-text   截图 → OCR → 找文字 → 点击文字中心
       wait-text    轮询 OCR，直到文字出现或超时
       clip-set / clip-get / paste   剪贴板操作（RDP 默认启用剪贴板重定向）
+      tunnel       发现 mstsc → 127.0.0.1:<port> 的本地端口隧道（AccessClient 场景）
+      wait-port    等待本机端口进入 LISTEN（隧道就绪检查）
+      health       窗口 + 隧道的综合健康检查
 
 .PARAMETER Action
     find | status | open-cmd | run-ps | type | keys | click | screenshot |
-    ocr | click-text | wait-text | clip-set | clip-get | paste
+    ocr | click-text | wait-text | clip-set | clip-get | paste |
+    tunnel | wait-port | health
 
 .PARAMETER Pattern
-    按标题筛选（默认不区分大小写的“包含”匹配，加 -Regex 则按正则）。
+    按标题筛选（默认不区分大小写的「包含」匹配，加 -Regex 则按正则）。
 
 .PARAMETER Class
     按窗口类名筛选，支持通配符，例如 -Class "TscShell*"。
@@ -67,7 +71,7 @@
     run-ps 直接在远端执行文件（可配合 \\tsclient 重定向驱动器）。
 
 .PARAMETER Encoded
-    run-ps 对短脚本使用 -EncodedCommand（不依赖剪贴板，受“运行”对话框长度限制）。
+    run-ps 对短脚本使用 -EncodedCommand（不依赖剪贴板，受「运行」对话框长度限制）。
 
 .PARAMETER ExitAfter
     脚本执行完后退出远端 PowerShell（默认保留窗口看输出）。
@@ -85,28 +89,46 @@
     OCR 语言，例如 zh-CN / en-US。默认使用用户配置语言。
 
 .PARAMETER TimeoutSec / IntervalMs
-    wait-text 的超时时间与轮询间隔。
+    wait-text / tunnel / wait-port / health 的超时时间与轮询间隔。
 
 .PARAMETER DryRun
     click-text 只输出坐标，不真正点击。
 
+.PARAMETER App
+    tunnel 按父进程 / 监听进程名过滤，例如 -App "AccessClient*"。
+
+.PARAMETER Port
+    tunnel 只显示指定本地端口；wait-port 指定要等待的端口；
+    health 手工指定隧道端口（默认从 mstsc 命令行 / 连接推断）。
+
+.PARAMETER Watch
+    tunnel 持续监控端口状态，变化时输出（Ctrl+C 退出）。
+
+.PARAMETER Launch
+    tunnel 对已声明但尚未连接的端口拉起 mstsc /v:127.0.0.1:<port>。
+
+.PARAMETER Screen
+    health 连续截图比较，用于检测画面是否卡死。
+
+.PARAMETER Connect
+    wait-port 额外做一次 TCP 连接探测（会向 RDP 端口发起握手）。
+
 .PARAMETER Json
-    以 JSON 输出（find / status / screenshot / ocr / click-text / wait-text / clip-get）。
+    以 JSON 输出（find / status / screenshot / ocr / click-text / wait-text /
+    clip-get / tunnel / wait-port / health）。
 
 .EXAMPLE
     .\RdpOps.ps1 find
 .EXAMPLE
     .\RdpOps.ps1 status -Json
 .EXAMPLE
-    .\RdpOps.ps1 open-cmd
+    .\RdpOps.ps1 tunnel
 .EXAMPLE
-    .\RdpOps.ps1 run-ps -Script "Get-Date; whoami"
+    .\RdpOps.ps1 tunnel -Watch -App "AccessClient*"
 .EXAMPLE
-    .\RdpOps.ps1 screenshot -Out shot.png
+    .\RdpOps.ps1 wait-port -Port 52341 -TimeoutSec 20
 .EXAMPLE
-    .\RdpOps.ps1 click-text -Text "确定" -DryRun
-.EXAMPLE
-    .\RdpOps.ps1 wait-text -Text "完成" -TimeoutSec 30
+    .\RdpOps.ps1 health -Any -ProcessName mstsc -Screen -Json
 .EXAMPLE
     # 本地测试（不需要 RDP）
     .\RdpOps.ps1 screenshot -Any -ProcessName notepad -Out notepad.png
@@ -117,7 +139,8 @@ param(
     [Parameter(Position = 0)]
     [ValidateSet('find', 'status', 'open-cmd', 'run-ps', 'type', 'keys', 'click',
                  'screenshot', 'ocr', 'click-text', 'wait-text',
-                 'clip-set', 'clip-get', 'paste')]
+                 'clip-set', 'clip-get', 'paste',
+                 'tunnel', 'wait-port', 'health')]
     [string]$Action = 'find',
 
     [string]$Pattern,
@@ -154,6 +177,13 @@ param(
     [int]$TimeoutSec = 15,
     [int]$IntervalMs = 800,
     [switch]$DryRun,
+
+    [string]$App,
+    [int]$Port = 0,
+    [switch]$Watch,
+    [switch]$Launch,
+    [switch]$Screen,
+    [switch]$Connect,
 
     [switch]$Json
 )
@@ -715,7 +745,7 @@ function Assert-RunDialogRemote {
     if ($fg.ClassName -eq '#32770' -or $fg.Title -match '(?i)run|运行') {
         [RdpNative]::SendCombo('esc')
         throw ("Win+R 被本机截获，没有发到远端。`n" +
-               "请把 mstsc 的“本地资源 → 键盘 → 应用 Windows 键组合”改成“在远程计算机上”，" +
+               "请把 mstsc 的「本地资源 → 键盘 → 应用 Windows 键组合」改成「在远程计算机上」，" +
                "或使用全屏连接。")
     }
     throw "Win+R 后前台窗口变成了 [$($fg.Title)]，按键没有送到 RDP 会话"
@@ -834,7 +864,7 @@ function Invoke-Ocr {
     }
 
     if ($null -eq $engine) {
-        throw ('OCR 引擎不可用。请在“设置 → 时间和语言 → 语言”中安装对应语言的 OCR 组件，' +
+        throw ('OCR 引擎不可用。请在「设置 → 时间和语言 → 语言」中安装对应语言的 OCR 组件，' +
                '或使用 -Language 指定已安装的语言（如 zh-CN / en-US）。')
     }
 
@@ -943,6 +973,281 @@ function Find-OcrMatches {
 }
 
 # ---------------------------------------------------------------------------
+# 本地隧道感知（AccessClient / mstsc → 127.0.0.1:<port>）
+# ---------------------------------------------------------------------------
+function Get-TcpTable {
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        try {
+            $rows = Get-NetTCPConnection -ErrorAction Stop
+            $mapped = foreach ($row in $rows) {
+                [pscustomobject]@{
+                    State         = [string]$row.State
+                    LocalAddress  = [string]$row.LocalAddress
+                    LocalPort     = [int]$row.LocalPort
+                    RemoteAddress = [string]$row.RemoteAddress
+                    RemotePort    = [int]$row.RemotePort
+                    OwningProcess = [int]$row.OwningProcess
+                }
+            }
+            return @($mapped)
+        } catch { }
+    }
+
+    # 回退：netstat -ano（只解析 TCP，足够定位回环隧道）
+    $result = @()
+    foreach ($line in (& netstat -ano -p TCP 2>$null)) {
+        $parts = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($parts.Count -lt 5 -or $parts[0] -ne 'TCP') { continue }
+        if ($parts[1] -notmatch '^(?<addr>.+):(?<port>\d+)$') { continue }
+        $laddr = $Matches.addr; $lport = [int]$Matches.port
+        if ($parts[2] -notmatch '^(?<addr>.+):(?<port>\d+)$') { continue }
+        $raddr = $Matches.addr; $rport = [int]$Matches.port
+        $stateText = switch ($parts[3].ToUpperInvariant()) {
+            'LISTENING'   { 'Listen' }
+            'ESTABLISHED' { 'Established' }
+            default       { $parts[3] }
+        }
+        $result += [pscustomobject]@{
+            State         = $stateText
+            LocalAddress  = $laddr.Trim('[', ']')
+            LocalPort     = $lport
+            RemoteAddress = $raddr.Trim('[', ']')
+            RemotePort    = $rport
+            OwningProcess = [int]$parts[4]
+        }
+    }
+    return $result
+}
+
+function Parse-LoopbackEndpoint {
+    param([string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
+
+    $patterns = @(
+        '/v:["'']?(?<host>\[[^\]]+\]|[^"''\s:]+)(?::(?<port>\d+))?',
+        'full address:s:(?<host>\[[^\]]+\]|[^:\s]+)(?::(?<port>\d+))?'
+    )
+    foreach ($pattern in $patterns) {
+        $m = [regex]::Match($CommandLine, $pattern, 'IgnoreCase')
+        if (-not $m.Success) { continue }
+        $hostName = $m.Groups['host'].Value.Trim('[', ']').ToLowerInvariant()
+        if ($hostName -notin @('127.0.0.1', 'localhost', '::1',
+                               '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1')) { continue }
+        $portValue = if ($m.Groups['port'].Success) { [int]$m.Groups['port'].Value } else { 3389 }
+        return [pscustomobject]@{ Host = $hostName; Port = $portValue }
+    }
+    return $null
+}
+
+function Get-LoopbackTunnels {
+    param([int]$Port = 0, [int]$ClientPid = 0)
+
+    $tcp = @(Get-TcpTable)
+    $listeners = @($tcp | Where-Object { $_.State -eq 'Listen' })
+    $connections = @($tcp | Where-Object { $_.State -eq 'Established' })
+    $processes = @(Get-CimInstance Win32_Process `
+        -Filter "Name='mstsc.exe' OR Name='msrdc.exe'" -ErrorAction SilentlyContinue |
+        Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)
+    $windows = @()
+    try { $windows = @([RdpNative]::GetWindows($false)) } catch { }
+
+    $loopback = @('127.0.0.1', '::1', '::ffff:127.0.0.1')
+    $anyAddress = @('127.0.0.1', '::1', '0.0.0.0', '::')
+    $results = @()
+
+    foreach ($proc in $processes) {
+        if ($ClientPid -gt 0 -and [int]$proc.ProcessId -ne $ClientPid) { continue }
+
+        $commandLine = [string]$proc.CommandLine
+        $declared = Parse-LoopbackEndpoint -CommandLine $commandLine
+
+        $ports = New-Object System.Collections.Generic.List[int]
+        if ($declared) { $ports.Add([int]$declared.Port) }
+        foreach ($row in @($connections | Where-Object {
+                    $_.OwningProcess -eq [int]$proc.ProcessId -and
+                    $_.RemoteAddress -in $loopback -and $_.RemotePort -gt 0 })) {
+            if (-not $ports.Contains([int]$row.RemotePort)) { $ports.Add([int]$row.RemotePort) }
+        }
+        if ($Port -gt 0) { $ports = @($ports | Where-Object { $_ -eq $Port }) }
+        if ($ports.Count -eq 0) { continue }
+
+        $window = $windows | Where-Object { $_.Pid -eq [int]$proc.ProcessId } | Select-Object -First 1
+        $parentName = ''
+        try { $parentName = (Get-Process -Id $proc.ParentProcessId -ErrorAction Stop).ProcessName } catch { }
+
+        foreach ($p in $ports) {
+            $listenRows = @($listeners | Where-Object {
+                    $_.LocalPort -eq $p -and $_.LocalAddress -in $anyAddress })
+            $listenerPid = if ($listenRows.Count -gt 0) { [int]$listenRows[0].OwningProcess } else { 0 }
+            $listenerName = ''
+            if ($listenerPid -gt 0) {
+                try { $listenerName = (Get-Process -Id $listenerPid -ErrorAction Stop).ProcessName } catch { }
+            }
+            $connected = @($connections | Where-Object {
+                    $_.OwningProcess -eq [int]$proc.ProcessId -and
+                    $_.RemotePort -eq $p -and $_.RemoteAddress -in $loopback }).Count -gt 0
+
+            $results += [pscustomobject][ordered]@{
+                Pid             = [int]$proc.ProcessId
+                Process         = [string]$proc.Name
+                ParentPid       = [int]$proc.ParentProcessId
+                ParentProcess   = $parentName
+                Port            = [int]$p
+                Endpoint        = "127.0.0.1:$p"
+                Declared        = [bool]($declared -and [int]$declared.Port -eq [int]$p)
+                Listening       = ($listenRows.Count -gt 0)
+                ListenerPid     = $listenerPid
+                ListenerProcess = $listenerName
+                Connected       = $connected
+                Ready           = (($listenRows.Count -gt 0) -and $connected)
+                WindowHandle    = $(if ($window) { '0x{0:X8}' -f $window.Handle.ToInt64() } else { '' })
+                WindowTitle     = $(if ($window) { $window.Title } else { '' })
+                CommandLine     = $commandLine
+            }
+        }
+    }
+
+    return @($results | Sort-Object Pid, Port)
+}
+
+function Format-RdpTunnel {
+    param($Tunnel)
+    $state = if ($Tunnel.Listening) {
+        "LISTEN:$($Tunnel.ListenerProcess)($($Tunnel.ListenerPid))"
+    } else { 'NO-LISTEN' }
+    $state += ' / ' + $(if ($Tunnel.Connected) { 'CONNECTED' } else { 'NOT-CONNECTED' })
+    $parent = if ($Tunnel.ParentProcess) { $Tunnel.ParentProcess } else { '?' }
+    return ('PID {0,-6} {1,-12} -> {2,-21} [{3}]  parent={4}({5})  {6}' -f `
+        $Tunnel.Pid, $Tunnel.Process, $Tunnel.Endpoint, $state,
+        $parent, $Tunnel.ParentPid, $Tunnel.WindowTitle)
+}
+
+function Get-LoopbackPortStatus {
+    param([int]$Port)
+    $rows = @(Get-TcpTable | Where-Object {
+            $_.LocalPort -eq $Port -and $_.State -eq 'Listen' -and
+            $_.LocalAddress -in @('127.0.0.1', '::1', '0.0.0.0', '::') })
+    $ownerPid = if ($rows.Count -gt 0) { [int]$rows[0].OwningProcess } else { 0 }
+    $ownerName = ''
+    if ($ownerPid -gt 0) {
+        try { $ownerName = (Get-Process -Id $ownerPid -ErrorAction Stop).ProcessName } catch { }
+    }
+    return [pscustomobject][ordered]@{
+        Port      = $Port
+        Listening = ($rows.Count -gt 0)
+        Addresses = @($rows | ForEach-Object { $_.LocalAddress } | Sort-Object -Unique)
+        Pid       = $ownerPid
+        Process   = $ownerName
+    }
+}
+
+function Wait-LoopbackPort {
+    param(
+        [int]$Port,
+        [int]$TimeoutSec = 30,
+        [int]$IntervalMs = 500,
+        [switch]$Connect
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($true) {
+        $status = Get-LoopbackPortStatus -Port $Port
+        if ($status.Listening) {
+            if ($Connect) {
+                $ok = $false
+                $client = New-Object System.Net.Sockets.TcpClient
+                try {
+                    $ok = $client.ConnectAsync('127.0.0.1', $Port).Wait(2000)
+                } catch {
+                    $ok = $false
+                } finally {
+                    $client.Close()
+                }
+                $status | Add-Member -NotePropertyName TcpConnect -NotePropertyValue $ok -Force
+            }
+            return $status
+        }
+        if ((Get-Date) -ge $deadline) { return $status }
+        Start-Sleep -Milliseconds ([Math]::Max(50, $IntervalMs))
+    }
+}
+
+function Get-RdpHealth {
+    param(
+        $Target,
+        [int]$Port = 0,
+        [switch]$CheckScreen,
+        [int]$ScreenIntervalMs = 600
+    )
+
+    $reasons = New-Object System.Collections.Generic.List[string]
+    $geom = Get-ClientGeometry $Target
+
+    if (-not $Target.Visible) { $reasons.Add('window_invisible') }
+    if ($Target.Minimized) { $reasons.Add('window_minimized') }
+    if ($geom.Width -le 0 -or $geom.Height -le 0) { $reasons.Add('client_area_empty') }
+
+    $hung = $false
+    try {
+        $proc = Get-Process -Id $Target.Pid -ErrorAction Stop
+        $hung = -not $proc.Responding
+    } catch { }
+    if ($hung) { $reasons.Add('window_not_responding') }
+
+    $tunnels = @(Get-LoopbackTunnels -Port $Port -ClientPid $Target.Pid)
+    $tunnel = if ($tunnels.Count -gt 0) { $tunnels[0] } else { $null }
+    if ($null -eq $tunnel) {
+        $reasons.Add('tunnel_not_found')
+    } else {
+        if (-not $tunnel.Listening) { $reasons.Add('tunnel_port_not_listening') }
+        if (-not $tunnel.Connected) { $reasons.Add('tunnel_not_connected') }
+    }
+
+    $screen = $null
+    if ($CheckScreen) {
+        if ($Target.Minimized -or $geom.Width -le 0 -or $geom.Height -le 0) {
+            $screen = [pscustomobject][ordered]@{ Checked = $false; Reason = 'window_unavailable' }
+        } else {
+            $first = Get-ClientScreenshot -Target $Target -DoNotActivate
+            $firstHash = (Get-FileHash -LiteralPath $first -Algorithm SHA256).Hash
+            Start-Sleep -Milliseconds ([Math]::Max(100, $ScreenIntervalMs))
+            $second = Get-ClientScreenshot -Target $Target -DoNotActivate
+            $secondHash = (Get-FileHash -LiteralPath $second -Algorithm SHA256).Hash
+            $changed = ($firstHash -ne $secondHash)
+            if (-not $changed) { $reasons.Add('screen_frozen') }
+            $screen = [pscustomobject][ordered]@{
+                Checked = $true
+                Changed = $changed
+                First   = $first
+                Second  = $second
+            }
+        }
+    }
+
+    $windowObject = ConvertTo-RdpWindow $Target
+    $windowObject | Add-Member -NotePropertyName ClientOrigin -Force `
+        -NotePropertyValue ("{0},{1}" -f $geom.Left, $geom.Top)
+    $windowObject | Add-Member -NotePropertyName ClientSize -Force `
+        -NotePropertyValue ("{0}x{1}" -f $geom.Width, $geom.Height)
+    $windowObject | Add-Member -NotePropertyName DpiScale -Force `
+        -NotePropertyValue ([Math]::Round([RdpNative]::DpiScale($Target.Handle), 3))
+    $windowObject | Add-Member -NotePropertyName Foreground -Force `
+        -NotePropertyValue ([RdpNative]::GetForegroundHandle().ToInt64() -eq $Target.Handle.ToInt64())
+
+    return [pscustomobject][ordered]@{
+        Healthy    = ($reasons.Count -eq 0)
+        Reasons    = @($reasons)
+        Window     = $windowObject
+        Hung       = $hung
+        ClientArea = [pscustomobject][ordered]@{
+            Left = $geom.Left; Top = $geom.Top; Width = $geom.Width; Height = $geom.Height
+        }
+        Tunnel     = $tunnel
+        Screen     = $screen
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 动作分发
 # ---------------------------------------------------------------------------
 $filter = @{
@@ -1025,7 +1330,7 @@ switch ($Action) {
             if (-not $ExitAfter) { $command += '-NoExit ' }
             $command += '-EncodedCommand ' + $payload
 
-            # 本机“运行”对话框有长度限制，太长自动退回剪贴板方式
+            # 本机「运行」对话框有长度限制，太长自动退回剪贴板方式
             if ($command.Length -le 200) {
                 Invoke-RemoteCommand -Target $target -Command $command -Wait $WaitMs
                 "已在远端启动 PowerShell（encoded 方式），脚本 $($body.Length) 字符"
@@ -1035,7 +1340,7 @@ switch ($Action) {
 
         Invoke-RemoteScriptViaClipboard -Target $target -Body $body -Wait $WaitMs -CloseAfter:$ExitAfter
         "已在远端启动 PowerShell（剪贴板方式），脚本 $($body.Length) 字符"
-        '提示：剪贴板方式要求 mstsc 已启用“剪贴板”重定向。'
+        '提示：剪贴板方式要求 mstsc 已启用「剪贴板」重定向。'
     }
 
     'type' {
@@ -1212,5 +1517,128 @@ switch ($Action) {
         [void][RdpNative]::ForceForeground($target.Handle)
         [RdpNative]::SendCombo('ctrl+v')
         "已粘贴 $($Text.Length) 个字符到 [$($target.Title)]"
+    }
+
+    'tunnel' {
+        $deadline = (Get-Date).AddSeconds([Math]::Max(0, $TimeoutSec))
+        do {
+            $tunnels = @(Get-LoopbackTunnels -Port $Port)
+            if ($App) {
+                $tunnels = @($tunnels | Where-Object {
+                        $_.ParentProcess -like $App -or $_.ListenerProcess -like $App })
+            }
+            if ($tunnels.Count -gt 0 -or (Get-Date) -ge $deadline) { break }
+            Start-Sleep -Milliseconds ([Math]::Max(50, $IntervalMs))
+        } while ($true)
+
+        if ($Launch) {
+            foreach ($item in @($tunnels | Where-Object { -not $_.Connected })) {
+                Start-Process mstsc -ArgumentList "/v:127.0.0.1:$($item.Port)"
+                "已拉起 mstsc /v:127.0.0.1:$($item.Port)"
+            }
+        }
+
+        if ($Watch) {
+            '监控本地隧道中，Ctrl+C 退出 ...'
+            $last = @{}
+            while ($true) {
+                $tunnels = @(Get-LoopbackTunnels -Port $Port)
+                if ($App) {
+                    $tunnels = @($tunnels | Where-Object {
+                            $_.ParentProcess -like $App -or $_.ListenerProcess -like $App })
+                }
+                $current = @{}
+                foreach ($item in $tunnels) {
+                    $current["$($item.Pid):$($item.Port)"] = "$($item.Listening)/$($item.Connected)"
+                }
+                $stamp = Get-Date -Format 'HH:mm:ss'
+                foreach ($item in $tunnels) {
+                    $key = "$($item.Pid):$($item.Port)"
+                    if (-not $last.ContainsKey($key) -or $last[$key] -ne $current[$key]) {
+                        "[$stamp] $(Format-RdpTunnel $item)"
+                    }
+                }
+                foreach ($key in @($last.Keys | Where-Object { -not $current.ContainsKey($_) })) {
+                    "[$stamp] 隧道消失: $key"
+                }
+                $last = $current
+                Start-Sleep -Milliseconds ([Math]::Max(200, $IntervalMs))
+            }
+        }
+
+        if ($Json) {
+            ConvertTo-Json -InputObject @($tunnels) -Depth 5
+        } elseif ($tunnels.Count -eq 0) {
+            Write-Warning '没有发现本地隧道：mstsc 未连接 127.0.0.1，或客户端进程不可见。'
+        } else {
+            $tunnels | ForEach-Object { Format-RdpTunnel $_ }
+        }
+        if ($tunnels.Count -eq 0) { exit 1 }
+    }
+
+    'wait-port' {
+        if ($Port -le 0) { throw '请用 -Port 指定要等待的本地端口' }
+        $status = Wait-LoopbackPort -Port $Port -TimeoutSec $TimeoutSec `
+            -IntervalMs $IntervalMs -Connect:$Connect
+        if ($Json) {
+            $status | ConvertTo-Json -Depth 4
+        } elseif ($status.Listening) {
+            $extra = ''
+            if ($Connect) {
+                $extra = if ($status.TcpConnect) { ' (TCP 连接成功)' } else { ' (TCP 连接失败)' }
+            }
+            "端口 $Port 已就绪: $($status.Addresses -join ', ')  " +
+            "进程 $($status.Process)($($status.Pid))$extra"
+        } else {
+            throw "等待端口 $Port 超时（${TimeoutSec}s）"
+        }
+        if (-not $status.Listening) { exit 1 }
+    }
+
+    'health' {
+        $targets = @(Get-RdpTargets @filter)
+        if ($targets.Count -eq 0) {
+            $payload = [pscustomobject][ordered]@{
+                Healthy = $false
+                Reasons = @('window_not_found')
+                Window  = $null
+                Tunnel  = $null
+            }
+            if ($Json) { $payload | ConvertTo-Json -Depth 6 }
+            else { Write-Warning '窗口未找到' }
+            exit 1
+        }
+        if ($Index -lt 0 -or $Index -ge $targets.Count) {
+            throw "索引 $Index 越界，共找到 $($targets.Count) 个窗口"
+        }
+
+        $payload = Get-RdpHealth -Target $targets[$Index] -Port $Port `
+            -CheckScreen:$Screen -ScreenIntervalMs $IntervalMs
+
+        if ($Json) {
+            $payload | ConvertTo-Json -Depth 8
+        } else {
+            "健康     : $(if ($payload.Healthy) { 'OK' } else { 'FAIL' })"
+            if ($payload.Reasons.Count -gt 0) {
+                "问题     : $($payload.Reasons -join ', ')"
+            }
+            "窗口     : $($payload.Window.Handle) [$($payload.Window.Title)] PID $($payload.Window.PID)"
+            "客户区   : $($payload.ClientArea.Left),$($payload.ClientArea.Top) " +
+                "$($payload.ClientArea.Width)x$($payload.ClientArea.Height)"
+            "状态     : visible=$($payload.Window.Visible) " +
+                "minimized=$($payload.Window.Minimized) hung=$($payload.Hung)"
+            if ($payload.Tunnel) {
+                "隧道     : $($payload.Tunnel.Endpoint)  " +
+                "listener=$($payload.Tunnel.ListenerProcess)($($payload.Tunnel.ListenerPid))  " +
+                "connected=$($payload.Tunnel.Connected)"
+            } else {
+                '隧道     : 未发现'
+            }
+            if ($payload.Screen -and $payload.Screen.Checked) {
+                "画面     : $(if ($payload.Screen.Changed) { '有变化' } else { '无变化（可能卡死）' })"
+            }
+        }
+
+        if (-not $payload.Healthy) { exit 1 }
     }
 }
